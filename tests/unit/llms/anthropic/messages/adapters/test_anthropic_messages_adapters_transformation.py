@@ -28,6 +28,9 @@ from litellm.llms.anthropic.messages.adapters.transformation import (
     create_tool_name_mapping,
     truncate_tool_name,
 )
+from litellm.completion_extras.litellm_responses_transformation.transformation import (
+    LiteLLMResponsesTransformationHandler,
+)
 from litellm.llms.anthropic.messages.native.mid_conversation_system import (
     CONVERTED_SYSTEM_NOTE,
 )
@@ -475,7 +478,10 @@ def test_translate_anthropic_messages_to_openai_thinking_blocks():
     assert result[1]["tool_calls"][0]["id"] == "toolu_01234"
 
 
-def test_translate_anthropic_messages_to_openai_drops_bridge_encrypted_reasoning_blocks():
+@pytest.mark.parametrize("custom_llm_provider", [None, "gemini", "anthropic", "bedrock"])
+def test_translate_anthropic_messages_to_openai_drops_bridge_encrypted_reasoning_blocks(
+    custom_llm_provider: str | None,
+):
     """A session that moves from an OpenAI reasoning model to a chat provider replays reasoning only OpenAI can read.
 
     Gemini rejects the whole request when such a block reaches it as a thought_signature, so the
@@ -504,12 +510,55 @@ def test_translate_anthropic_messages_to_openai_drops_bridge_encrypted_reasoning
         ),
     ]
 
-    result = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(messages=anthropic_messages)
+    result = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(
+        messages=anthropic_messages, custom_llm_provider=custom_llm_provider
+    )
 
     assert [m["role"] for m in result] == ["user", "assistant", "assistant"]
     assert not result[1].get("thinking_blocks")
     assert result[1]["content"] == "The Norwegian."
     assert [b["signature"] for b in result[2]["thinking_blocks"]] == ["EqQBCkYIAxgCIkA_signed"]
+
+
+@pytest.mark.parametrize("custom_llm_provider", ["openai", "chatgpt", "github_copilot"])
+@pytest.mark.parametrize("summary", [[], [{"type": "summary_text", "text": "Oslo is further north."}]])
+def test_bridged_encrypted_reasoning_round_trips_through_messages_to_the_responses_api(
+    custom_llm_provider: str, summary: list[dict[str, str]]
+):
+    tool_call: Final = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": '{"city": "Oslo"}'},
+    }
+    reasoning_item: Final = {"type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA_enc", "summary": summary}
+    response: Final = ModelResponse(
+        choices=[
+            Choices(
+                finish_reason="tool_calls",
+                message=Message(content=None, tool_calls=[tool_call], reasoning_items=[reasoning_item]),
+            )
+        ],
+        usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+    adapter: Final = LiteLLMAnthropicMessagesAdapter()
+    assistant_content: Final = adapter.translate_openai_response_to_anthropic(response)["content"]
+
+    chat_messages: Final = adapter.translate_anthropic_messages_to_openai(
+        messages=[
+            AnthropicMessagesUserMessageParam(role="user", content="Which city is colder?"),
+            AnthopicMessagesAssistantMessageParam(role="assistant", content=assistant_content),
+            AnthropicMessagesUserMessageParam(
+                role="user", content=[{"type": "tool_result", "tool_use_id": "call_1", "content": "-7 C"}]
+            ),
+        ],
+        custom_llm_provider=custom_llm_provider,
+    )
+    input_items, _ = LiteLLMResponsesTransformationHandler().convert_chat_completion_messages_to_responses_api(
+        chat_messages
+    )
+
+    assert [item["type"] for item in input_items] == ["message", "reasoning", "function_call", "function_call_output"]
+    assert input_items[1]["encrypted_content"] == "gAAAA_enc"
 
 
 def test_translate_anthropic_messages_to_openai_sets_reasoning_content():

@@ -1,6 +1,6 @@
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, TypeVar
 
@@ -9,7 +9,13 @@ from typing_extensions import ReadOnly
 
 import litellm
 from litellm.constants import X_LITELLM_DISABLE_CALLBACKS
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.internal_call_metadata import sanitize_user_api_key_auth
+from litellm.litellm_core_utils.prompt_templates.common_utils import encrypted_reasoning_signature
+from litellm.types.llms.anthropic import (
+    AnthropicResponseContentBlockRedactedThinking,
+    AnthropicResponseContentBlockThinking,
+)
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.utils import TRUSTED_CALLBACK_VARS_FIELD, ModelInfo, StandardCallbackDynamicParams
 
@@ -17,6 +23,7 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObject
 
 OPENAI_MAX_PROMPT_CACHE_KEY_LENGTH: Final = 64
+REASONING_SUMMARY_PART_SEPARATOR: Final = "\n\n"
 
 _EFFORT_DEGRADATION_CHAIN: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     {
@@ -234,3 +241,33 @@ def normalize_reasoning_effort_value(
 
     accepted_tiers: Final = tuple(level for level in supported if level != _THINKING_OFF)
     return next((level for level in (*chain, *accepted_tiers) if level in supported), chain[-1])
+
+
+def _summary_part_text(part: object) -> str:
+    mapping: Final = as_str_mapping(part)
+    text: Final = mapping.get("text") if mapping is not None else getattr(part, "text", None)
+    return str(text or "")
+
+
+def thinking_block_from_reasoning_item(
+    summary: Iterable[object],
+    encrypted_content: object,
+) -> dict[str, object] | None:  # mutable-ok: API message payload
+    """The one Anthropic block for a Responses reasoning item.
+
+    The item's encrypted reasoning rides the block's opaque field (`signature`, or
+    `data` when there is no summary text) so the client echoes it back and the next
+    turn replays the very item OpenAI produced; without it the signature stays empty,
+    since only Anthropic can sign a thinking block.
+    """
+    text: Final = REASONING_SUMMARY_PART_SEPARATOR.join(
+        part_text for part in summary if (part_text := _summary_part_text(part))
+    )
+    if not isinstance(encrypted_content, str) or not encrypted_content:
+        if not text:
+            return None
+        return AnthropicResponseContentBlockThinking(type="thinking", thinking=text, signature=None).model_dump()
+    signature: Final = encrypted_reasoning_signature(encrypted_content)
+    if not text:
+        return AnthropicResponseContentBlockRedactedThinking(type="redacted_thinking", data=signature).model_dump()
+    return AnthropicResponseContentBlockThinking(type="thinking", thinking=text, signature=signature).model_dump()

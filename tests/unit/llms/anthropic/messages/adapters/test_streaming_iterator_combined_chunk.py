@@ -18,6 +18,7 @@ import anthropic
 import httpx
 import pytest
 
+from litellm.litellm_core_utils.prompt_templates.common_utils import encrypted_reasoning_signature
 from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import (
     convert_to_streaming_response,
     convert_to_streaming_response_async,
@@ -28,8 +29,10 @@ from litellm.llms.anthropic.messages.adapters.streaming_iterator import (
 )
 from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
 from litellm.types.utils import (
+    ChatCompletionDeltaToolCall,
     Choices,
     Delta,
+    Function,
     Message,
     ModelResponse,
     ModelResponseStream,
@@ -407,4 +410,41 @@ def test_native_stream_thinking_blocks_keep_their_text_once():
         {"type": "thinking", "thinking": "abcd", "signature": "SIG_A"},
         {"type": "thinking", "thinking": "efgh", "signature": "SIG_B"},
         {"type": "text", "text": "hi"},
+    ]
+
+
+async def _bridged_responses_stream_with_encrypted_reasoning() -> "AsyncIterator[ModelResponseStream]":
+    reasoning_item: Final = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "gAAAA_enc",
+        "summary": [{"type": "summary_text", "text": "Oslo is further north."}],
+    }
+    tool_call: Final = ChatCompletionDeltaToolCall(
+        index=0, id="call_1", type="function", function=Function(name="get_weather", arguments='{"city": "Oslo"}')
+    )
+    for chunk in (
+        ModelResponseStream(
+            choices=[StreamingChoices(index=0, delta=Delta(role="assistant", reasoning_content="Oslo is further north."))]
+        ),
+        ModelResponseStream(choices=[StreamingChoices(index=0, delta=Delta(tool_calls=[tool_call]))]),
+        ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    index=0, delta=Delta(content="", reasoning_items=[reasoning_item]), finish_reason="tool_calls"
+                )
+            ],
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+    ):
+        yield chunk
+
+
+def test_bridged_stream_hands_the_client_its_encrypted_reasoning_once():
+    content: Final = _anthropic_sdk_final_content(_bridged_responses_stream_with_encrypted_reasoning())
+
+    assert content == [
+        {"type": "thinking", "thinking": "Oslo is further north.", "signature": ""},
+        {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Oslo"}},
+        {"type": "redacted_thinking", "data": encrypted_reasoning_signature("gAAAA_enc")},
     ]

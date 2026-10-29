@@ -29,7 +29,7 @@ from litellm.exceptions import ContextWindowExceededError, MidStreamFallbackErro
 from litellm.litellm_core_utils.core_helpers import as_str_mapping, attribute_items
 from litellm.litellm_core_utils.hidden_params import set_hidden_params
 from litellm.llms.anthropic.messages.safeguards import StreamedSafeguardResults
-from litellm.llms.anthropic.messages.utils import anthropic_sse_frame
+from litellm.llms.anthropic.messages.utils import anthropic_sse_frame, thinking_block_from_reasoning_item
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.anthropic import (
     AppliedEdit,
@@ -44,6 +44,7 @@ from litellm.types.llms.anthropic import (
 )
 from litellm.types.llms.openai import (
     AllMessageValues,
+    ChatCompletionReasoningItem,
     ChatCompletionRedactedThinkingBlock,
     ChatCompletionThinkingBlock,
     ChatCompletionToolParam,
@@ -59,6 +60,8 @@ if TYPE_CHECKING:
 _STREAMING_DELTA_TYPES: Final = frozenset(get_args(StreamingContentBlockDeltaType))
 _SSE_EVENT: Final = TypeAdapter(Mapping[str, object])
 _THINKING_BLOCK: Final = TypeAdapter(ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock)
+_THINKING_BLOCKS: Final = TypeAdapter(list[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock])
+_REASONING_ITEMS: Final = TypeAdapter(list[ChatCompletionReasoningItem])
 _PROMPT_MESSAGES: Final = TypeAdapter(list[AllMessageValues])
 _PROMPT_TOOLS: Final = TypeAdapter(list[ChatCompletionToolParam])
 
@@ -451,10 +454,32 @@ class _CombinedChunkSplitter:
             for position, block in enumerate(blocks)
         )
 
+    @staticmethod
+    def _with_encrypted_reasoning_blocks(chunk: "ModelResponseStream") -> "ModelResponseStream":
+        """A bridged Responses stream reports reasoning only as ``reasoning_items`` on its last chunk.
+
+        Their summary text already streamed as ``reasoning_content``, so only the encrypted reasoning
+        becomes a block, letting the client replay it on the next turn.
+        """
+        choices: Final = _optional_attr_sequence(chunk, "choices")
+        if len(choices) != 1:
+            return chunk
+        delta: Final = _optional_attr(choices[0], "delta")
+        if _optional_attr(delta, "thinking_blocks"):
+            return chunk
+        items: Final = _REASONING_ITEMS.validate_python(_optional_attr(delta, "reasoning_items") or [])
+        candidates: Final = (thinking_block_from_reasoning_item((), item.get("encrypted_content")) for item in items)
+        blocks: Final = _THINKING_BLOCKS.validate_python(tuple(block for block in candidates if block is not None))
+        if not blocks:
+            return chunk
+        piece: Final = copy.deepcopy(chunk)
+        piece.choices[0].delta.thinking_blocks = blocks
+        return piece
+
     def _expand(self, chunk: "ModelResponseStream") -> "tuple[ModelResponseStream, ...]":
         split_chunks: Final = tuple(
             split_chunk
-            for combined_chunk in self._split(chunk)
+            for combined_chunk in self._split(self._with_encrypted_reasoning_blocks(chunk))
             for split_chunk in self._split_by_payload_kind(combined_chunk)  # comprehension-ok: flattens nested splits
         )
         block_chunks: Final = tuple(itertools.chain.from_iterable(map(self._split_thinking_blocks, split_chunks)))

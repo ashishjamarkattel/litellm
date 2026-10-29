@@ -13,7 +13,6 @@ from typing import Any, Final, cast
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     TOOL_RESULT_IMAGE_BOUNDARY,
     TOOL_RESULT_IMAGE_PLACEHOLDER,
-    encrypted_reasoning_signature,
     responses_reasoning_items_from_thinking_blocks,
     with_prompt_cache_breakpoint,
 )
@@ -29,6 +28,7 @@ from litellm.llms.anthropic.messages.utils import (
     is_reasoning_auto_summary_enabled,
     json_copy_or_original,
     prompt_cache_key_from_user_id,
+    thinking_block_from_reasoning_item,
 )
 from litellm.types.llms.anthropic import (
     AllAnthropicPassThroughMessageValues,
@@ -36,9 +36,7 @@ from litellm.types.llms.anthropic import (
     AnthropicFinishReason,
     AnthropicMessagesRequest,
     AnthropicMessagesToolChoice,
-    AnthropicResponseContentBlockRedactedThinking,
     AnthropicResponseContentBlockText,
-    AnthropicResponseContentBlockThinking,
     AnthropicResponseContentBlockToolUse,
     AnthropicSystemMessageContent,
 )
@@ -51,7 +49,6 @@ from litellm.types.llms.openai import (
     ResponsesAPIResponse,
 )
 
-REASONING_SUMMARY_PART_SEPARATOR: Final = "\n\n"
 RESPONSES_INCLUDE_ENCRYPTED_REASONING: Final = "reasoning.encrypted_content"
 
 
@@ -238,38 +235,6 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             for block in content
             if isinstance(block, dict) and block.get("type") == "text" and (text := block.get("text"))  # pyright: ignore[reportUnnecessaryIsInstance]  # untrusted client payload
         ]
-
-    @staticmethod
-    def _summary_part_text(part: object) -> str:
-        if isinstance(part, Mapping):
-            mapping: Final = cast(Mapping[str, object], part)  # cast-ok: summary parts are untyped provider json
-            return str(mapping.get("text") or "")
-        return str(getattr(part, "text", None) or "")
-
-    @classmethod
-    def _thinking_block_from_reasoning_item(
-        cls,
-        summary: Iterable[object],
-        encrypted_content: object,
-    ) -> dict[str, object] | None:  # mutable-ok: API message payload
-        """The one Anthropic block for a Responses reasoning item.
-
-        The item's encrypted reasoning rides the block's opaque field (`signature`, or
-        `data` when there is no summary text) so the client echoes it back and the next
-        turn replays the very item OpenAI produced; without it the signature stays empty,
-        since only Anthropic can sign a thinking block.
-        """
-        text: Final = REASONING_SUMMARY_PART_SEPARATOR.join(
-            part_text for part in summary if (part_text := cls._summary_part_text(part))
-        )
-        if not isinstance(encrypted_content, str) or not encrypted_content:
-            if not text:
-                return None
-            return AnthropicResponseContentBlockThinking(type="thinking", thinking=text, signature=None).model_dump()
-        signature: Final = encrypted_reasoning_signature(encrypted_content)
-        if not text:
-            return AnthropicResponseContentBlockRedactedThinking(type="redacted_thinking", data=signature).model_dump()
-        return AnthropicResponseContentBlockThinking(type="thinking", thinking=text, signature=signature).model_dump()
 
     @staticmethod
     def _assistant_block_group_key(indexed_block: tuple[int, Mapping[str, object]]) -> str:
@@ -741,7 +706,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
         for item in response.output:
             if isinstance(item, ResponseReasoningItem):
-                reasoning_block = self._thinking_block_from_reasoning_item(item.summary, item.encrypted_content)
+                reasoning_block = thinking_block_from_reasoning_item(item.summary, item.encrypted_content)
                 if reasoning_block is not None:
                     content.append(reasoning_block)
 
@@ -793,7 +758,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                     ).model_dump()
                                 )
                 elif item_type == "reasoning":
-                    reasoning_block = self._thinking_block_from_reasoning_item(
+                    reasoning_block = thinking_block_from_reasoning_item(
                         cast(Iterable[object], item.get("summary") or ()),  # cast-ok: untyped provider json
                         item.get("encrypted_content"),
                     )

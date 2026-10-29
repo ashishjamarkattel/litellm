@@ -21,7 +21,7 @@ from litellm.llms.anthropic.messages.native.utils import (
     responses_output_refusal_text,
 )
 from litellm.llms.anthropic.messages.safeguards import StreamedSafeguardResults
-from litellm.llms.anthropic.messages.utils import anthropic_sse_frame
+from litellm.llms.anthropic.messages.utils import REASONING_SUMMARY_PART_SEPARATOR, anthropic_sse_frame
 from litellm.responses.streaming_iterator import (
     map_stream_error_to_exception,
     partial_responses_incomplete_event_on_disconnect,
@@ -30,10 +30,7 @@ from litellm.responses.streaming_iterator import (
 from litellm.types.llms.anthropic_messages.anthropic_response import AnthropicUsage
 from litellm.types.llms.base import LiteLLMBaseModel
 
-from .transformation import (
-    REASONING_SUMMARY_PART_SEPARATOR,
-    LiteLLMAnthropicToResponsesAPIAdapter,
-)
+from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObject

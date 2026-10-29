@@ -15,7 +15,9 @@ from litellm.llms.anthropic.messages.utils import (
     is_reasoning_auto_summary_enabled,
     json_copy_or_original,
     prompt_cache_key_from_user_id,
+    thinking_block_from_reasoning_item,
 )
+from litellm.responses.bridge_check import RESPONSES_ONLY_PROVIDERS
 from litellm.responses.utils import auto_reasoning_summary
 
 # OpenAI has a 64-character limit for function/tool names
@@ -24,6 +26,7 @@ OPENAI_MAX_TOOL_NAME_LENGTH: Final = 64
 TOOL_NAME_HASH_LENGTH: Final = 8
 TOOL_NAME_PREFIX_LENGTH: Final = OPENAI_MAX_TOOL_NAME_LENGTH - TOOL_NAME_HASH_LENGTH - 1  # 55
 PROVIDERS_PROXYING_AN_UNKNOWN_BACKEND: Final = frozenset({"litellm_proxy"})
+ENCRYPTED_REASONING_REPLAY_PROVIDERS: Final = RESPONSES_ONLY_PROVIDERS | {"openai"}
 _COMPACTION_BLOCK: Final = TypeAdapter(dict[str, JsonValue])
 
 
@@ -187,6 +190,7 @@ from litellm.types.llms.openai import (
     ChatCompletionAssistantToolCall,
     ChatCompletionImageObject,
     ChatCompletionImageUrlObject,
+    ChatCompletionReasoningItem,
     ChatCompletionRedactedThinkingBlock,
     ChatCompletionRequest,
     ChatCompletionSystemMessage,
@@ -203,7 +207,7 @@ from litellm.types.llms.openai import (
     ChatCompletionUserMessage,
     ToolMessageContentPart,
 )
-from litellm.types.utils import Choices, LlmProviders, ModelResponse, StreamingChoices, Usage
+from litellm.types.utils import Choices, LlmProviders, Message, ModelResponse, StreamingChoices, Usage
 from litellm.utils import supports_mid_conversation_system
 
 from .streaming_iterator import AnthropicSSEStream, AnthropicStreamWrapper
@@ -214,6 +218,17 @@ if TYPE_CHECKING:
     from litellm.types.llms.anthropic import ContentBlockContentBlockDict
 
 ToolResultContent: TypeAlias = str | list[ToolMessageContentPart]
+
+
+def _encrypted_reasoning_blocks(message: Message) -> tuple[Mapping[str, object], ...]:
+    reasoning_items: Final[Sequence[ChatCompletionReasoningItem] | None] = getattr(message, "reasoning_items", None)
+    if not reasoning_items or not any(item.get("encrypted_content") for item in reasoning_items):
+        return ()
+    blocks: Final = (
+        thinking_block_from_reasoning_item(item.get("summary") or (), item.get("encrypted_content"))
+        for item in reasoning_items
+    )
+    return tuple(block for block in blocks if block is not None)
 
 
 def target_supports_mid_conversation_system(model: str | None, custom_llm_provider: str | None) -> bool:
@@ -479,7 +494,11 @@ class LiteLLMAnthropicMessagesAdapter:
         preserve_midturn_system: bool = False,
     ) -> list[AllMessageValues]:
         new_messages: Final[list[AllMessageValues]] = []
-        replayable_messages: Final = strip_encrypted_reasoning_blocks_from_anthropic_messages(messages)
+        replayable_messages: Final = (
+            messages
+            if custom_llm_provider in ENCRYPTED_REASONING_REPLAY_PROVIDERS
+            else strip_encrypted_reasoning_blocks_from_anthropic_messages(messages)
+        )
         leading_count: Final = next(
             (i for i, m in enumerate(replayable_messages) if not is_system_role_message(m)),
             len(replayable_messages),
@@ -1407,6 +1426,8 @@ class LiteLLMAnthropicMessagesAdapter:
                                 data=str(data_value) if data_value is not None else "",
                             ).model_dump()
                         )
+            elif reasoning_blocks := _encrypted_reasoning_blocks(choice.message):
+                new_content.extend(map(dict, reasoning_blocks))
             # Handle reasoning_content when thinking_blocks is not present
             elif hasattr(choice.message, "reasoning_content") and choice.message.reasoning_content:
                 new_content.append(
